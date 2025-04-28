@@ -1,6 +1,6 @@
 # Redis SFDC-Observe Integration
 
-A data integration pipeline for sending Salesforce CRM data and AWS Cost and Usage Reports to Observe.io for monitoring and analytics.
+A data integration pipeline for sending Salesforce CRM data and AWS Cost and Usage Reports to Observe for monitoring and analytics.
 
 ## Overview
 
@@ -9,7 +9,7 @@ This project provides an automated solution for:
 - Fetching Salesforce data (Accounts, Opportunities) 
 - Processing AWS Cost and Usage Reports (CUR)
 - Transforming and standardizing the data
-- Sending the data to Observe.io for analytics and monitoring
+- Sending the data to Observe for analytics and monitoring
 
 ## Architecture
 
@@ -24,7 +24,7 @@ This project provides an automated solution for:
 - AWS CLI configured with appropriate permissions
 - Python 3.9+
 - Salesforce credentials with API access
-- Observe.io credentials
+- Observe credentials
 - AWS account with Cost Explorer access
 
 ## Installation
@@ -39,7 +39,7 @@ The project includes a build-and-deploy script that handles:
 - Configuring IAM roles and policies
 
 ```bash
-./build-and-deploy.sh --env dev --lambda-bucket your-lambda-bucket-name --cur-bucket your-cur-bucket-name
+./build-and-deploy.sh --env dev 
 ```
 
 ### Manual Configuration
@@ -105,11 +105,3 @@ This generates a diagnostic report with CloudWatch logs, Lambda configuration, a
 - `infrastructure/` - CloudFormation templates
 - `scripts/` - Helper scripts for deployment and diagnostics
 - `samples/` - Sample data files for testing
-
-## License
-
-This project is proprietary and confidential.
-
-## Contributors
-
-- Redis Cloud Operations Team
