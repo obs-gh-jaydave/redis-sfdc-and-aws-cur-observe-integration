@@ -1,0 +1,56 @@
+# Local testing configuration
+local_config.py
+mock_aws.py
+
+# Test output
+test_output/
+
+# Virtual environments
+venv/
+env/
+.env/
+.env
+
+# IDE settings
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Deployment packages
+*.zip
+package/
+build-output/
+
+# Lambda test outputs
+lambda-test-output.json
+cur-fetcher-response.json
+
+# AWS diagnostics
+aws-lambda-diagnostics-*.txt
+
+# Credentials and secrets
+credentials.json
+*.pem
+*.key
+
+# Temporary files
+temp/
+*.tmp
+*.temp
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Sensitive environment files (redundant but explicit)
+.env

@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Redis Salesforce and AWS CUR to Observe Integration'
+
+Parameters:
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda code package
+  
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the Lambda code package
+  
+  CoreLayerCodeS3Key:
+    Type: String
+    Description: S3 key for the Core Lambda Layer code package
+    Default: data-processing-core-layer.zip
+  
+  PandasLayerCodeS3Key:
+    Type: String
+    Description: S3 key for the Pandas Lambda Layer code package
+    Default: pandas-layer.zip
+  
+  CURBucketName:
+    Type: String
+    Description: S3 bucket for AWS Cost and Usage Reports
+    Default: redis-cloud-billing-reports
+  
+  Environment:
+    Type: String
+    Description: Deployment environment
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - production
+  
+  CURFetchSchedule:
+    Type: String
+    Description: Schedule expression for fetching CUR data
+    Default: 'cron(0 1 * * ? *)'  # Run at 1 AM UTC daily
+  
+  UseS3ForParquet:
+    Type: String
+    Description: Use S3 for direct parquet processing instead of loading into memory
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  SkipBucketCreation:
+    Type: String
+    Description: Skip S3 bucket creation (use when bucket already exists)
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  UseS3ParquetProcessing: !Equals [!Ref UseS3ForParquet, 'true']
+  CreateBucket: !Equals [!Ref SkipBucketCreation, 'false']
+
+Resources:
+  # Core Lambda Layer for lighter dependencies
+  CoreProcessingLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub redis-data-processing-core-layer-${Environment}
+      Description: Layer containing boto3, simple-salesforce, requests, and aws-lambda-powertools
+      Content:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref CoreLayerCodeS3Key
+      CompatibleRuntimes:
+        - python3.9
+  
+  # Pandas Lambda Layer for data processing
+  PandasLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub redis-pandas-layer-${Environment}
+      Description: Layer containing pandas and numpy
+      Content:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref PandasLayerCodeS3Key
+      CompatibleRuntimes:
+        - python3.9
+  
+  # Dead Letter Queue for failed records
+  FailedRecordsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'redis-observe-failed-records-${Environment}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300
+
+  # Work queue for fan-out pattern
+  WorkQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'redis-data-ingestion-work-queue-${Environment}'
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FailedRecordsDLQ.Arn
+        maxReceiveCount: 3
+
+  # IAM role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/redis/sfdc/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/redis/observe/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/redis/account_mapping
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/redis/account_mapping/*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${CURBucketName}
+                  - !Sub arn:aws:s3:::${CURBucketName}/*
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt FailedRecordsDLQ.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:redis/salesforce-*
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:redis/observe-*
+        - PolicyName: SQSWorkQueueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt WorkQueue.Arn
+        - PolicyName: GlueJobAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateJob
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                Resource: 
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/*
+
+  # Lambda function for data ingestion
+  DataIngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub redis-data-ingestion-${Environment}
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Runtime: python3.9
+      Timeout: 900  # 15 minutes max
+      MemorySize: 1024  # Increased for better performance
+      Layers:
+        - !Ref CoreProcessingLayer
+        - !Ref PandasLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          DEPLOY_ENV: !Ref Environment
+          FAILED_RECORDS_QUEUE_URL: !Ref FailedRecordsDLQ
+          CHECKPOINT_BUCKET: !Ref CURBucketName
+          WORK_QUEUE_URL: !Ref WorkQueue
+          USE_S3_FOR_PARQUET: !Ref UseS3ForParquet
+
+  # Permission for S3 to invoke Lambda - Must be before the bucket with notifications
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataIngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${CURBucketName}
+
+  # S3 bucket for CUR files - Create after Lambda to avoid circular dependency
+  CURBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DependsOn: [DataIngestionFunction, S3InvokeLambdaPermission]
+    Properties:
+      BucketName: !Ref CURBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: aws-cur/
+            Function: !GetAtt DataIngestionFunction.Arn
+
+  # Bucket policy requiring HTTPS
+  CURBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref CURBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Action: 's3:*'
+            Principal: '*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${CURBucketName}'
+              - !Sub 'arn:aws:s3:::${CURBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # IAM role for CUR Fetcher Lambda
+  CURFetcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostExplorerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${CURBucketName}/*
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DataIngestionFunction.Arn
+
+  # Lambda function for CUR data fetching
+  CURFetcherFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DataIngestionFunction
+    Properties:
+      FunctionName: !Sub redis-cur-fetcher-${Environment}
+      Handler: src.lambda_functions.cur_fetcher.lambda_handler
+      Role: !GetAtt CURFetcherRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Layers:
+        - !Ref CoreProcessingLayer
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          DEPLOY_ENV: !Ref Environment
+          TARGET_S3_BUCKET: !Ref CURBucketName
+          DATA_INGESTION_FUNCTION: !Ref DataIngestionFunction
+
+  # Schedule for Salesforce data sync
+  SalesforceScheduleRule:
+    Type: AWS::Events::Rule
+    DependsOn: DataIngestionFunction
+    Properties:
+      Name: !Sub RedisSalesforceDailySync-${Environment}
+      Description: 'Trigger Salesforce data sync daily'
+      ScheduleExpression: 'cron(0 0 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataIngestionFunction.Arn
+          Id: SalesforceSync
+          Input: '{"action":"salesforce"}'
+
+  # Schedule for CUR data fetcher
+  CURFetchScheduleRule:
+    Type: AWS::Events::Rule
+    DependsOn: CURFetcherFunction
+    Properties:
+      Name: !Sub RedisCURFetchSchedule-${Environment}
+      Description: 'Trigger CUR data fetching daily'
+      ScheduleExpression: !Ref CURFetchSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CURFetcherFunction.Arn
+          Id: CURFetch
+
+  # Permission for CloudWatch Events to invoke Salesforce Lambda
+  SalesforceSchedulePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: [DataIngestionFunction, SalesforceScheduleRule]
+    Properties:
+      FunctionName: !Ref DataIngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SalesforceScheduleRule.Arn
+
+  # Permission for CloudWatch Events to invoke CUR Fetcher Lambda
+  CURFetchSchedulePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: [CURFetcherFunction, CURFetchScheduleRule]
+    Properties:
+      FunctionName: !Ref CURFetcherFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CURFetchScheduleRule.Arn
+
+  # IAM role for Glue jobs (for Parquet processing)
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Condition: UseS3ParquetProcessing
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${CURBucketName}
+                  - !Sub arn:aws:s3:::${CURBucketName}/*
+
+Outputs:
+  DataIngestionFunction:
+    Description: 'Data Ingestion Lambda Function'
+    Value: !GetAtt DataIngestionFunction.Arn
+  
+  CURFetcherFunction:
+    Description: 'CUR Fetcher Lambda Function'
+    Value: !GetAtt CURFetcherFunction.Arn
+  
+  CURBucket:
+    Description: 'S3 Bucket for CUR files'
+    Value: !Ref CURBucketName
+  
+  FailedRecordsDLQ:
+    Description: 'SQS Queue for failed records'
+    Value: !Ref FailedRecordsDLQ
+  
+  WorkQueue:
+    Description: 'SQS Work Queue for parallel processing'
+    Value: !Ref WorkQueue
+  
+  CoreProcessingLayer:
+    Description: 'Core Lambda Layer for essential dependencies'
+    Value: !Ref CoreProcessingLayer
+    
+  PandasLayer:
+    Description: 'Pandas Lambda Layer for data processing'
+    Value: !Ref PandasLayer
+    
+  GlueServiceRole:
+    Description: 'IAM role for Glue jobs'
+    Value: !If [UseS3ParquetProcessing, !GetAtt GlueServiceRole.Arn, 'Not Used']
